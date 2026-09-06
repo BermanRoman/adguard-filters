@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+#
+#: bump — поднимает версию и TimeUpdated в файле фильтра AdGuard
+#:
+#: Использование:
+#:   bump [patch|minor|major] [ФАЙЛ] [--dry-run]
+#:   bump --help
+#:
+#: Аргументы:
+#:   patch   поднять патч-версию (1.1.0 → 1.1.1) — по умолчанию
+#:   minor   поднять минорную  (1.1.3 → 1.2.0)
+#:   major   поднять мажорную  (1.2.5 → 2.0.0)
+#:   ФАЙЛ    путь к фильтру; по умолчанию все .txt в filters/
+#:
+#: Опции:
+#:   --dry-run   показать, что будет сделано, без записи
+#:   --help      эта справка
+#:
+#: Переменные окружения:
+#:   FILTERS_DIR   каталог с фильтрами (по умолчанию: <репозиторий>/filters)
+#:
+#: Зачем: AdGuard решает, применять ли обновление, по строке Version.
+#: Если поправить правила и не поднять версию, файл на GitHub обновится,
+#: а в браузере останутся старые правила. Симптом неочевидный, поэтому
+#: бамп вынесен в скрипт.
+#:
+#: После бампа не забыть закоммитить и запушить.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FILTERS_DIR="${FILTERS_DIR:-$REPO_ROOT/filters}"
+
+LEVEL="patch"
+DRY_RUN=0
+TARGET=""
+
+usage() { grep '^#:' "$0" | sed 's/^#:\{0,1\} \{0,1\}//'; }
+
+for arg in "$@"; do
+  case "$arg" in
+    --help|-h)      usage; exit 0 ;;
+    --dry-run|-n)   DRY_RUN=1 ;;
+    patch|minor|major) LEVEL="$arg" ;;
+    -*)             echo "Неизвестная опция: $arg" >&2; exit 1 ;;
+    *)              TARGET="$arg" ;;
+  esac
+done
+
+if [[ -n "$TARGET" ]]; then
+  [[ -f "$TARGET" ]] || { echo "Файл не найден: $TARGET" >&2; exit 1; }
+  FILES=("$TARGET")
+else
+  [[ -d "$FILTERS_DIR" ]] || { echo "Каталог не найден: $FILTERS_DIR" >&2; exit 1; }
+  FILES=()
+  while IFS= read -r f; do FILES+=("$f"); done \
+    < <(find "$FILTERS_DIR" -maxdepth 1 -type f -name '*.txt' | sort)
+  [[ ${#FILES[@]} -gt 0 ]] || { echo "В $FILTERS_DIR нет .txt" >&2; exit 1; }
+fi
+
+NOW="$(date -u +"%Y-%m-%dT%H:%M:%S+00:00")"
+CHANGED=0
+
+for FILE in "${FILES[@]}"; do
+  OLD="$(grep -m1 '^! Version:' "$FILE" | sed 's/^! Version:[[:space:]]*//' || true)"
+
+  if [[ ! "$OLD" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "  ПРОПУСК  $(basename "$FILE") — нет корректной строки Version (найдено: '${OLD:-—}')" >&2
+    continue
+  fi
+
+  IFS='.' read -r MAJ MIN PAT <<< "$OLD"
+  case "$LEVEL" in
+    major) MAJ=$((MAJ + 1)); MIN=0; PAT=0 ;;
+    minor) MIN=$((MIN + 1)); PAT=0 ;;
+    patch) PAT=$((PAT + 1)) ;;
+  esac
+  NEW="$MAJ.$MIN.$PAT"
+
+  echo "  $(basename "$FILE"): $OLD → $NEW   ($NOW)"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    continue
+  fi
+
+  TMP="$(mktemp)"
+  # Через временный файл, а не sed -i: BSD и GNU sed требуют разного
+  # синтаксиса для in-place, а так работает везде одинаково.
+  sed \
+    -e "s|^! Version:.*|! Version: $NEW|" \
+    -e "s|^! TimeUpdated:.*|! TimeUpdated: $NOW|" \
+    "$FILE" > "$TMP"
+
+  if ! grep -q "^! Version: $NEW$" "$TMP"; then
+    rm -f "$TMP"
+    echo "  ОШИБКА   $(basename "$FILE") — запись не подтвердилась, файл не тронут" >&2
+    exit 1
+  fi
+
+  mv "$TMP" "$FILE"
+  CHANGED=$((CHANGED + 1))
+done
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo
+  echo "Сухой прогон, ничего не записано."
+  exit 0
+fi
+
+echo
+if [[ $CHANGED -eq 0 ]]; then
+  echo "Ничего не изменено."
+  exit 1
+fi
+
+echo "Обновлено файлов: $CHANGED"
+echo "Дальше: git add -A && git commit -m 'bump' && git push"
